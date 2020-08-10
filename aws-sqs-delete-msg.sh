@@ -2,22 +2,25 @@
 
 ###################################################################
 #
-# This script uses aws cli and jq (https://stedolan.github.io/jq/).
+# This script uses aws-cli and jq (https://stedolan.github.io/jq/).
 #
 ###################################################################
 
-max_num_msgs=10
-wait_time_secs=2
-visibility_timeout=30
+MAX_NUM_MSGS=10
+WAIT_TIME_SECS=2
+VISIBILITY_TIMEOUT=30
 invalid_token_error="ExpiredToken"
 queue_not_found="AWS.SimpleQueueService.NonExistentQueue"
 
 AWS_REGION=us-east-1
+#AWS_PROFILE=default
 ACTION=INFO
 MSG_ATTRS_TO_RETRIEVE=""
 JQ_MSG_ATTR_FILTER=""
 MSG_ATTRIBUTES_KEY_VALS=""
-NUM_OF_MSGS_TO_SCAN=1000
+MSG_ATTRIBUTES_FILE_PATH=""
+MSG_ATTRIBUTES_ABS_FILE_PATH=""
+NUM_OF_MSGS_TO_SCAN=100
 DEBUG_LOG=false
 
 red_txt=$(tput setaf 1)
@@ -39,10 +42,30 @@ function process_arguments() {
                MSG_ATTRIBUTES_KEY_VALS="$2"
                shift 2
                ;;
+          --message-attributes-filter-file)
+               MSG_ATTRIBUTES_FILE_PATH="$2"
+               shift 2
+               ;;
           --num-of-msgs-to-scan)
                NUM_OF_MSGS_TO_SCAN="$2"
                shift 2
                ;;
+          --wait-time-seconds)
+               WAIT_TIME_SECS="$2"
+               shift 2
+               ;;
+          --visibility-timeout)
+               VISIBILITY_TIMEOUT="$2"
+               shift 2
+               ;;
+          --region)
+               AWS_REGION="$2"
+               shift 2
+               ;;
+          # --profile)
+          #      AWS_PROFILE="$2"
+          #      shift 2
+          #      ;;
           --action | -a)
                ACTION="$2"
                shift 2
@@ -64,17 +87,46 @@ function process_arguments() {
 }
 
 function process_msg_attribute_key_val() {
+     # log_debug_msg "Process msg attributes $MSG_ATTRIBUTES_KEY_VALS"
+     # Read the msg attributes passed from command line.
+     # Split them using delimeter ',' using -d flag. Then split each key value pair.
+     if [ -z "$MSG_ATTRIBUTES_FILE_PATH" ]; then
+          process_msg_attributes_cmd_args
+     else
+          process_msg_attributes_file
+     fi
+}
 
-     log_debug_msg "Process msg attributes $MSG_ATTRIBUTES_KEY_VALS"
-     # Read the msg attributes passed from command line. Split them using delimeter ',' using -d flag. Then split each key value pair.
+function process_msg_attributes_cmd_args() {
      while read -d, -r key_val_pair; do
-          IFS='=' read -r key value <<<"$key_val_pair"
-          temp_filter='select(.MessageAttributes  | to_entries[]|(.key == "__KEY__") and (.value.StringValue == "__VALUE__"))'
-          temp_filter="${temp_filter/__KEY__/$key}"
-          temp_filter="${temp_filter/__VALUE__/$value}"
-          MSG_ATTRS_TO_RETRIEVE="${MSG_ATTRS_TO_RETRIEVE} ${key}"
-          JQ_MSG_ATTR_FILTER="${JQ_MSG_ATTR_FILTER} ${temp_filter} |"
+          build_jq_msg_attr_filter $key_val_pair
      done <<<"$MSG_ATTRIBUTES_KEY_VALS,"
+
+}
+
+function process_msg_attributes_file() {
+     log_debug_msg "Processing message attributes file \"$MSG_ATTRIBUTES_FILE_PATH\""
+     if ! [ -z "$MSG_ATTRIBUTES_FILE_PATH" ]; then
+          MSG_ATTRIBUTES_ABS_FILE_PATH=$(realpath -e ${MSG_ATTRIBUTES_FILE_PATH} 2>/dev/null)
+
+          if [ -z "$MSG_ATTRIBUTES_ABS_FILE_PATH" ]; then
+               log_error_msg "Missing \"$MSG_ATTRIBUTES_FILE_PATH\" file."
+               exit 1
+          fi
+          log_debug_msg "Message attributes file absolute path $MSG_ATTRIBUTES_ABS_FILE_PATH"
+          while IFS= read -r key_val_pair; do
+               build_jq_msg_attr_filter $key_val_pair
+          done <$MSG_ATTRIBUTES_ABS_FILE_PATH
+     fi
+}
+
+function build_jq_msg_attr_filter() {
+     IFS='=' read -r key value <<<"$1"
+     temp_filter='select(.MessageAttributes  | to_entries[]|(.key == "__KEY__") and (.value.StringValue == "__VALUE__"))'
+     temp_filter="${temp_filter/__KEY__/$key}"
+     temp_filter="${temp_filter/__VALUE__/$value}"
+     MSG_ATTRS_TO_RETRIEVE="${MSG_ATTRS_TO_RETRIEVE} ${key}"
+     JQ_MSG_ATTR_FILTER="${JQ_MSG_ATTR_FILTER} ${temp_filter} |"
 }
 
 function get_sqs_queue_url() {
@@ -112,6 +164,8 @@ function validate_input_arguments() {
 
      validate_msg_attributes
      validate_num_of_msg_to_scan
+     validate_wait_time_secs
+     validate_visibility_timeout
 
 }
 
@@ -141,21 +195,35 @@ function is_valid_queue() {
 
 function validate_num_of_msg_to_scan() {
 
-     if [[ !("$NUM_OF_MSGS_TO_SCAN" =~ ^[0-9]+$) || -z "$NUM_OF_MSGS_TO_SCAN" || "$NUM_OF_MSGS_TO_SCAN" -le 0 || "$NUM_OF_MSGS_TO_SCAN" -gt 1000 ]]; then
-          log_error_msg "--num-of-msgs-to-scan value must be between 1 and 1000."
+     if [[ -z "$NUM_OF_MSGS_TO_SCAN" || !("$NUM_OF_MSGS_TO_SCAN" =~ ^[0-9]+$) || "$NUM_OF_MSGS_TO_SCAN" -le 0 || "$NUM_OF_MSGS_TO_SCAN" -gt 1000 ]]; then
+          log_error_msg "\"--num-of-msgs-to-scan\" value must be between 1 and 1000."
           print_help
      fi
 
      if [ "$NUM_OF_MSGS_TO_SCAN" -lt 10 ]; then
-          max_num_msgs=$NUM_OF_MSGS_TO_SCAN
+          MAX_NUM_MSGS=$NUM_OF_MSGS_TO_SCAN
      fi
 
+}
+
+function validate_wait_time_secs() {
+     if [[ -z "$WAIT_TIME_SECS" || !("$WAIT_TIME_SECS" =~ ^[0-9]+$) || "$WAIT_TIME_SECS" -lt 0 || "$WAIT_TIME_SECS" -gt 20 ]]; then
+          log_error_msg "\"--wait-time-seconds\" value must be between 0 and 20."
+          print_help
+     fi
+}
+
+function validate_visibility_timeout() {
+     if [[ -z "$VISIBILITY_TIMEOUT" || !("$VISIBILITY_TIMEOUT" =~ ^[0-9]+$) || "$VISIBILITY_TIMEOUT" -lt 0 || "$VISIBILITY_TIMEOUT" -gt 43200 ]]; then
+          log_error_msg "\"--visibility-timeout\" value must be between 0 and 43200."
+          print_help
+     fi
 }
 
 function is_valid_action() {
      log_debug_msg "Validating message action. Message action is $ACTION"
      if ! [[ "$ACTION" == "INFO" || "$ACTION" == "DELETE" ]]; then
-          log_error_msg "--action parameter value must be either INFO or DELETE. Default value is INFO. "
+          log_error_msg "\"--action\" parameter value must be either INFO or DELETE. Default value is INFO. "
           print_help
      fi
 }
@@ -165,13 +233,16 @@ function validate_msg_attributes() {
      process_msg_attribute_key_val
      log_debug_msg "MSG_ATTRS_TO_RETRIEVE is ${MSG_ATTRS_TO_RETRIEVE}"
      if [ -z "${MSG_ATTRS_TO_RETRIEVE// /}" ]; then
-          log_error_msg "You must pass at least one msg attribute and value."
+          log_error_msg "You must pass either \"--message-attributes-filter\" or \"--message-attributes-filter-file\" with a valid key-value pair."
           print_help
      fi
 }
 
 function generate_jq_msg_filter_cmd() {
-     JQ_MSG_FILTER_CMD='jq -c -r -M '"'"'[.Messages[] | select(.MessageAttributes | length > 0) | __JQ_MSG_ATTR_FILTER__ {MessageId, MessageAttributes, ReceiptHandle} ]'"'"'  <<< $messages'
+
+     JQ_MSG_FILTER_CMD='jq -c -r -M '"'"'[.Messages[] | select(.MessageAttributes | length > 0) 
+          | __JQ_MSG_ATTR_FILTER__ {MessageId, Body, MessageAttributes, ReceiptHandle} ]'"'"'  <<< $messages'
+
      if [ -z "$JQ_MSG_ATTR_FILTER" ]; then
           process_msg_attribute_key_val
      fi
@@ -186,12 +257,12 @@ function process_sqs_queue_msgs() {
      while [ $counter -lt $NUM_OF_MSGS_TO_SCAN ]; do
 
           messages=$(
-               aws sqs receive-message --queue-url $QUEUE_URL --max-number-of-messages $max_num_msgs \
-               --wait-time-seconds $wait_time_secs --visibility-timeout $visibility_timeout --message-attribute-names $MSG_ATTRS_TO_RETRIEVE
+               aws sqs receive-message --queue-url $QUEUE_URL --max-number-of-messages $MAX_NUM_MSGS \
+               --wait-time-seconds $WAIT_TIME_SECS --visibility-timeout $VISIBILITY_TIMEOUT --message-attribute-names $MSG_ATTRS_TO_RETRIEVE
           )
 
           if $DEBUG_LOG; then
-               log_json $messages
+               log_json "$messages"
           fi
 
           new_msg_count=$(jq -c -r -M '.Messages | length' <<<$messages)
@@ -204,7 +275,7 @@ function process_sqs_queue_msgs() {
           filtered_messages=$(eval "$JQ_MSG_FILTER_CMD")
 
           log_msg "Filtered Msgs (i.e. Msgs matching the given msg attributes): "
-          jq '[.[] | {MessageId,MessageAttributes} ]' <<<$filtered_messages
+          jq '[.[] | {MessageId, Body, MessageAttributes} ]' <<<$filtered_messages
 
           if [ "$ACTION" == "DELETE" ]; then
 
@@ -227,7 +298,7 @@ function process_sqs_queue_msgs() {
 }
 
 function print_help() {
-     log_msg "
+     log_msg "Usage:
      
 Description
 ***********
@@ -240,8 +311,11 @@ Synopsis
 
        $0 
      --queue-name | -q <value>
-     --message-attributes-filter <value>
+     --message-attributes-filter | --message-attributes-filter-file <value>
      [--num-of-msgs-to-scan <value>]
+     [--wait-time-seconds <value>]
+     [--visibility-timeout <value>]
+     [--region <value>]
      [--action < INFO | DELETE >]
      [--help | -h]
      [--debug-log]
@@ -263,10 +337,49 @@ Options
      The message attributes to query for messages. Pass message attributes as key=value pair.
      Pass multiple attributes as comma separated string. Pass the string in double quotes.
 
-\"--num-of-msgs-to-scan\" (number)
+     Message attribute key values are case-sensitive.
+
+
+\"--message-attributes-filter-file\" (string)
+
+     The file path of message attributes. The file path can be relative/absolute.
+     Each line of the file should contain key=value pair. 
+
+     Sample File content:
+     --------------------
+     company=css
+     location=Bethesda
+     department=IT  
+
+     Message attribute key values are case-sensitive.
+
+\"--wait-time-seconds\" (integer)
+
+     The duration (in seconds) for which the call waits for a message to arrive in the queue before returning. 
+     If a message is available, the call returns sooner than \"--wait-time-seconds\" . 
+     If no messages are available and the wait time expires, the call returns successfully with an empty list of messages.
+
+     The maximum wait time is 20 secs.
+
+     Default value is 3.
+
+\"--visibility-timeout\" (integer)
+
+     The duration (in seconds) that the received messages are hidden from subsequent 
+     retrieve requests after being retrieved by a ReceiveMessage request.
+
+     Default value is 30.
+
+\"--region\" (string)
+
+     The AWS region the queue belongs to.
+     
+     Default value is \"us-east-1\".
+
+\"--num-of-msgs-to-scan\" (integer)
 
      Number of messages to retrive from the queue before stopping the poll. 
-     The value must be between 1-1000. Default value is 1000.
+     The value must be between 1-1000. Default value is 100.
 
 \"--action\" (INFO|DELETE)
 
@@ -277,7 +390,8 @@ Options
 
 \"--help\" | \"-h\" (string)
 
-     Prints how to use this script and details about all the options.
+     Prints how to use this script and details about all the options and exits.
+     No furthers actions will be taken when \"--help\" argument is passed. 
 
 \"--debug-log\" (string)
 
@@ -301,6 +415,13 @@ Examples
      Example 3:
      ----------
      $0 --help
+
+
+     Example 4:
+     ----------
+     
+     $0 --queue-name MyQueue --message-attributes-filter-file \"../msg-attribute-key-values.txt\"
+
 
 "
 
